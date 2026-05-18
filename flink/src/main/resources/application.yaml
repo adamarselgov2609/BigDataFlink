@@ -1,3 +1,0 @@
-flink:
-  app-name: flink-spring
-  submit-jobs-on-app-start: true

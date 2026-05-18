@@ -1,0 +1,143 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: bigdata_flink_postgres
+    environment:
+      POSTGRES_DB: bigdata_flink
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - flink_postgres_data:/var/lib/postgresql/data
+      - ./sql/01_init.sql:/docker-entrypoint-initdb.d/01_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bigdata_flink"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: bigdata_flink_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2182:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: bigdata_flink_kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9094:9092"
+      - "29094:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  init-kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -lc "kafka-topics --bootstrap-server kafka:29092 --if-not-exists --create --topic sales_raw --partitions 1 --replication-factor 1"
+
+  jobmanager:
+    image: flink:1.18.1-scala_2.12-java11
+    container_name: bigdata_flink_jobmanager
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      init-kafka:
+        condition: service_completed_successfully
+    ports:
+      - "8082:8081"
+    environment:
+      JOB_MANAGER_RPC_ADDRESS: jobmanager
+    command: >
+      bash -lc "/docker-entrypoint.sh jobmanager &
+      JM_PID=$!;
+      sleep 25;
+      /opt/flink/bin/sql-client.sh -f /opt/flink/usrlib/job.sql;
+      wait $JM_PID"
+    volumes:
+      - ./flink_job:/opt/flink/usrlib
+      - ./flink_job/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar
+      - ./flink_job/flink-connector-jdbc-3.2.0-1.18.jar:/opt/flink/lib/flink-connector-jdbc-3.2.0-1.18.jar
+      - ./flink_job/postgresql-42.7.3.jar:/opt/flink/lib/postgresql-42.7.3.jar
+
+  taskmanager:
+    image: flink:1.18.1-scala_2.12-java11
+    container_name: bigdata_flink_taskmanager
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      JOB_MANAGER_RPC_ADDRESS: jobmanager
+    volumes:
+      - ./flink_job:/opt/flink/usrlib
+      - ./flink_job/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar
+      - ./flink_job/flink-connector-jdbc-3.2.0-1.18.jar:/opt/flink/lib/flink-connector-jdbc-3.2.0-1.18.jar
+      - ./flink_job/postgresql-42.7.3.jar:/opt/flink/lib/postgresql-42.7.3.jar
+
+  producer:
+    image: python:3.12-slim
+    depends_on:
+      kafka:
+        condition: service_healthy
+      init-kafka:
+        condition: service_completed_successfully
+    working_dir: /app
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - ./:/app
+    command: >
+      bash -lc "pip install --no-cache-dir kafka-python && python kafka_producer/producer.py"
+
+  results:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+      producer:
+        condition: service_completed_successfully
+      jobmanager:
+        condition: service_started
+    environment:
+      PGPASSWORD: postgres
+    command: >
+      bash -lc '
+      until psql -h postgres -U postgres -d bigdata_flink -Atc "SELECT COUNT(*) FROM dwh.fact_sales" | grep -q "^10000$"; do
+        echo "Waiting for fact_sales = 10000...";
+        sleep 5;
+      done;
+      echo "===== FINAL COUNTS =====";
+      psql -h postgres -U postgres -d bigdata_flink -c "SELECT COUNT(*) AS dim_date FROM dwh.dim_date;";
+      psql -h postgres -U postgres -d bigdata_flink -c "SELECT COUNT(*) AS dim_customer FROM dwh.dim_customer;";
+      psql -h postgres -U postgres -d bigdata_flink -c "SELECT COUNT(*) AS dim_customer_pet FROM dwh.dim_customer_pet;";
+      psql -h postgres -U postgres -d bigdata_flink -c "SELECT COUNT(*) AS dim_seller FROM dwh.dim_seller;";
+      psql -h postgres -U postgres -d bigdata_flink -c "SELECT COUNT(*) AS dim_product FROM dwh.dim_product;";
+      psql -h postgres -U postgres -d bigdata_flink -c "SELECT COUNT(*) AS dim_store FROM dwh.dim_store;";
+      psql -h postgres -U postgres -d bigdata_flink -c "SELECT COUNT(*) AS dim_supplier FROM dwh.dim_supplier;";
+      psql -h postgres -U postgres -d bigdata_flink -c "SELECT COUNT(*) AS fact_sales FROM dwh.fact_sales;";
+      '
+
+volumes:
+  flink_postgres_data:
